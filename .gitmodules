@@ -1,0 +1,3 @@
+[submodule "Savitzky-Golay-Filter"]
+	path = Savitzky-Golay-Filter
+	url = https://github.com/bravesean05/Savitzky-Golay-Filter.git

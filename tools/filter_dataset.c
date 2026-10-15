@@ -32,6 +32,9 @@
 
 #define MAX_BLOCK 4096
 
+/** Number of distinct ground-truth labels, 0 through 3. */
+#define N_LABELS 4
+
 /** Per-channel pipeline state and accumulated statistics. */
 typedef struct {
     EogEpoch *ep;
@@ -41,6 +44,14 @@ typedef struct {
     double    min;
     double    max;
     size_t    count;
+
+    /* Per-label accumulators, for scoring the output against ground truth.
+     * `out` tracks the magnitude of the standardized output, `sd` the epoch
+     * deviation that produced it. The deviation is a block-level quantity, so
+     * every sample in a block is credited with its block's value. */
+    double    out_abs[N_LABELS];
+    double    sd_sum[N_LABELS];
+    size_t    label_count[N_LABELS];
 } Channel;
 
 static int channel_init(Channel *ch, const EogEpochConfig *cfg)
@@ -52,7 +63,14 @@ static int channel_init(Channel *ch, const EogEpochConfig *cfg)
     return (ch->ep != NULL) ? 0 : -1;
 }
 
-static void channel_accumulate(Channel *ch, const float *values, int n)
+/**
+ * @brief Fold one emitted block into the running statistics.
+ *
+ * @param labels  Ground-truth label for each emitted sample.
+ * @param sd      Epoch deviation that standardized this block.
+ */
+static void channel_accumulate(Channel *ch, const float *values, int n,
+                               const unsigned char *labels, double sd)
 {
     for (int i = 0; i < n; i++) {
         double v = (double)values[i];
@@ -61,6 +79,38 @@ static void channel_accumulate(Channel *ch, const float *values, int n)
         if (v < ch->min) ch->min = v;
         if (v > ch->max) ch->max = v;
         ch->count++;
+
+        unsigned char lab = labels[i];
+        if (lab < N_LABELS) {
+            ch->out_abs[lab] += (v < 0.0) ? -v : v;
+            ch->sd_sum[lab] += sd;
+            ch->label_count[lab]++;
+        }
+    }
+}
+
+/**
+ * @brief Print output magnitude and epoch deviation per label.
+ *
+ * Standardizing each epoch against its own deviation puts every window on the
+ * same scale, so the output magnitude column tends to flatten across labels
+ * whatever the underlying movement was. The deviation column is the scale that
+ * was divided out, and is where the separation between movement types survives.
+ */
+static void channel_label_report(const Channel *ch, const char *name)
+{
+    printf("\n  %s, by ground-truth label\n", name);
+    printf("    %-16s %12s %14s %10s\n",
+           "label", "mean |out|", "mean epoch sd", "samples");
+    for (int lab = 0; lab < N_LABELS; lab++) {
+        if (ch->label_count[lab] == 0) {
+            continue;
+        }
+        double n = (double)ch->label_count[lab];
+        printf("    %-16s %12.4f %14.2f %10zu\n",
+               eog_label_name((unsigned char)lab),
+               ch->out_abs[lab] / n, ch->sd_sum[lab] / n,
+               ch->label_count[lab]);
     }
 }
 
@@ -167,7 +217,13 @@ int main(int argc, char **argv)
             eog_dataset_free(&ds);
             return 1;
         }
-        fprintf(out, "sample,time_s,raw_h,filt_h,raw_v,filt_v,label\n");
+        /* mean_* and sd_* are the epoch statistics that standardized the block
+         * this row belongs to, repeated across the block's samples. sd_* is the
+         * amplitude the z-score divided out, and carries the separation between
+         * movement types that filt_* does not. */
+        fprintf(out, "sample,time_s,"
+                     "raw_h,filt_h,mean_h,sd_h,"
+                     "raw_v,filt_v,mean_v,sd_v,label\n");
     }
 
     /* The first emitted sample sits this far into the first epoch */
@@ -187,16 +243,29 @@ int main(int argc, char **argv)
         }
 
         blocks++;
-        channel_accumulate(&h, h.block, nh);
-        channel_accumulate(&v, v.block, nv);
+
+        /* Epoch statistics for the block just emitted. Read now, before the
+         * next push replaces them. */
+        double mean_h = (double)eog_epoch_last_mean(h.ep);
+        double sd_h   = (double)eog_epoch_last_stddev(h.ep);
+        double mean_v = (double)eog_epoch_last_mean(v.ep);
+        double sd_v   = (double)eog_epoch_last_stddev(v.ep);
+
+        channel_accumulate(&h, h.block, nh, ds.control + absolute, sd_h);
+        channel_accumulate(&v, v.block, nv, ds.control + absolute, sd_v);
 
         if (out != NULL) {
             for (int k = 0; k < nh; k++) {
                 size_t idx = absolute + (size_t)k;
-                fprintf(out, "%zu,%.6f,%.6f,%.6f,%.6f,%.6f,%u\n",
+                fprintf(out,
+                        "%zu,%.6f,"
+                        "%.6f,%.6f,%.6f,%.6f,"
+                        "%.6f,%.6f,%.6f,%.6f,%u\n",
                         idx, (double)idx / rate,
                         (double)ds.horizontal[idx], (double)h.block[k],
+                        mean_h, sd_h,
                         (double)ds.vertical[idx], (double)v.block[k],
+                        mean_v, sd_v,
                         (unsigned)ds.control[idx]);
             }
         }
@@ -211,6 +280,9 @@ int main(int argc, char **argv)
         printf("  csv           : %s\n", out_path);
         fclose(out);
     }
+
+    channel_label_report(&h, "horizontal");
+    channel_label_report(&v, "vertical");
 
     eog_epoch_destroy(h.ep);
     eog_epoch_destroy(v.ep);

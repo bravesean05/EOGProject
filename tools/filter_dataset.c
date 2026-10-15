@@ -10,6 +10,18 @@
  *   filter_dataset <input.eog> [options]
  *
  *   -o <file>     Write CSV here. Without it, only the summary is printed.
+ *   -b <file>     Write a compact binary of the same series, for MATLAB. CSV
+ *                 of a whole recording runs to 20 MB and is slow to parse;
+ *                 this is the same data in a tenth of the space and loads with
+ *                 one fread per series. Layout, little-endian:
+ *
+ *                   char[8]     "EOGFILT1"
+ *                   uint32      n          emitted samples
+ *                   uint32      first      absolute index of the first one
+ *                   float32     sample_rate_hz
+ *                   float32[n]  filt_h, then filt_v, sd_h, sd_v
+ *                   uint8[n]    label
+ *
  *   -e <n>        Epoch length in samples (default 100).
  *   -s <n>        Stride in samples (default 10).
  *   -w <n>        Savitzky-Golay half window (default 5).
@@ -23,6 +35,7 @@
  */
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -138,6 +151,7 @@ int main(int argc, char **argv)
 
     const char *in_path = argv[1];
     const char *out_path = NULL;
+    const char *bin_path = NULL;
     size_t limit = 0;
 
     EogEpochConfig cfg = EOG_EPOCH_DEFAULT_CONFIG;
@@ -149,6 +163,7 @@ int main(int argc, char **argv)
         }
         const char *val = argv[i + 1];
         if      (strcmp(argv[i], "-o") == 0) out_path = val;
+        else if (strcmp(argv[i], "-b") == 0) bin_path = val;
         else if (strcmp(argv[i], "-e") == 0) cfg.epoch_samples = (size_t)atol(val);
         else if (strcmp(argv[i], "-s") == 0) cfg.stride = (size_t)atol(val);
         else if (strcmp(argv[i], "-w") == 0) cfg.sg_half_window = atoi(val);
@@ -226,8 +241,29 @@ int main(int argc, char **argv)
                      "raw_v,filt_v,mean_v,sd_v,label\n");
     }
 
+    /* Buffers for the binary export, collected as blocks are emitted */
+    float *bin_fh = NULL, *bin_fv = NULL, *bin_sh = NULL, *bin_sv = NULL;
+    unsigned char *bin_lab = NULL;
+    size_t bin_n = 0;
+    if (bin_path != NULL) {
+        bin_fh  = (float *)malloc(total * sizeof(float));
+        bin_fv  = (float *)malloc(total * sizeof(float));
+        bin_sh  = (float *)malloc(total * sizeof(float));
+        bin_sv  = (float *)malloc(total * sizeof(float));
+        bin_lab = (unsigned char *)malloc(total);
+        if (bin_fh == NULL || bin_fv == NULL || bin_sh == NULL ||
+            bin_sv == NULL || bin_lab == NULL) {
+            fprintf(stderr, "%s: out of memory for the binary export\n", argv[0]);
+            free(bin_fh); free(bin_fv); free(bin_sh); free(bin_sv); free(bin_lab);
+            bin_path = NULL;
+            bin_fh = bin_fv = bin_sh = bin_sv = NULL;
+            bin_lab = NULL;
+        }
+    }
+
     /* The first emitted sample sits this far into the first epoch */
     size_t absolute = cfg.epoch_samples - cfg.stride - (size_t)cfg.sg_half_window;
+    size_t first_absolute = absolute;
     size_t blocks = 0;
 
     for (size_t i = 0; i < total; i++) {
@@ -254,6 +290,18 @@ int main(int argc, char **argv)
         channel_accumulate(&h, h.block, nh, ds.control + absolute, sd_h);
         channel_accumulate(&v, v.block, nv, ds.control + absolute, sd_v);
 
+        if (bin_fh != NULL) {
+            for (int k = 0; k < nh; k++) {
+                size_t idx = absolute + (size_t)k;
+                bin_fh[bin_n]  = h.block[k];
+                bin_fv[bin_n]  = v.block[k];
+                bin_sh[bin_n]  = (float)sd_h;
+                bin_sv[bin_n]  = (float)sd_v;
+                bin_lab[bin_n] = ds.control[idx];
+                bin_n++;
+            }
+        }
+
         if (out != NULL) {
             for (int k = 0; k < nh; k++) {
                 size_t idx = absolute + (size_t)k;
@@ -279,6 +327,30 @@ int main(int argc, char **argv)
     if (out != NULL) {
         printf("  csv           : %s\n", out_path);
         fclose(out);
+    }
+
+    if (bin_fh != NULL) {
+        FILE *bf = fopen(bin_path, "wb");
+        if (bf == NULL) {
+            fprintf(stderr, "%s: cannot write %s\n", argv[0], bin_path);
+        } else {
+            uint32_t n32 = (uint32_t)bin_n;
+            uint32_t first32 = (uint32_t)first_absolute;
+            float rate32 = ds.sample_rate_hz;
+            fwrite("EOGFILT1", 1, 8, bf);
+            fwrite(&n32, sizeof n32, 1, bf);
+            fwrite(&first32, sizeof first32, 1, bf);
+            fwrite(&rate32, sizeof rate32, 1, bf);
+            fwrite(bin_fh, sizeof(float), bin_n, bf);
+            fwrite(bin_fv, sizeof(float), bin_n, bf);
+            fwrite(bin_sh, sizeof(float), bin_n, bf);
+            fwrite(bin_sv, sizeof(float), bin_n, bf);
+            fwrite(bin_lab, 1, bin_n, bf);
+            fclose(bf);
+            printf("  binary        : %s (%zu samples from index %zu)\n",
+                   bin_path, bin_n, first_absolute);
+        }
+        free(bin_fh); free(bin_fv); free(bin_sh); free(bin_sv); free(bin_lab);
     }
 
     channel_label_report(&h, "horizontal");

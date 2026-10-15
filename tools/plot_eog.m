@@ -1,23 +1,33 @@
 function T = plot_eog(source, varargin)
-%PLOT_EOG  Plot a raw EOG recording against the filtered output, side by side.
+%PLOT_EOG  Plot a raw EOG recording against the filtered output.
 %
 %   Reads the CSV written by filter_dataset, which carries the raw signal, the
 %   standardized and smoothed output, the epoch statistics behind that output,
 %   and the ground-truth label, all indexed by the same absolute sample.
 %
-%   The raw signal and the filtered output cannot share an axis: raw sits in
-%   the hundreds while the output is a z-score of roughly +/-3, so one would
-%   flatten the other. They go in stacked panels with a shared time axis
-%   instead, linked so that zooming one zooms all.
+%   Raw and filtered cannot share one y axis. Raw sits in the hundreds while
+%   the output is a z-score of roughly +/-3, so a single scale flattens one of
+%   them into a line. Two ways out, both offered here:
+%
+%     'overlay' (default)  Both traces on one set of axes, raw against the
+%                          left scale and the filtered output against the
+%                          right, so their shapes can be compared directly.
+%     'stacked'            Separate panels, one trace each.
 %
 %   plot_eog(csvPath)
-%       Plots the first 20 seconds of both channels.
+%       Overlays the first 20 seconds of both channels.
 %
 %   plot_eog(csvPath, 'TimeRange', [t0 t1])
 %       Plots the window from t0 to t1 seconds.
 %
+%   plot_eog(csvPath, 'Style', 'stacked')
+%       One trace per panel instead of overlaid.
+%
 %   plot_eog(csvPath, 'Channel', 'h')
 %       Plots the horizontal channel only. Accepts 'h', 'v' or 'both'.
+%
+%   plot_eog(csvPath, 'ShowMean', false)
+%       Omits the epoch mean drawn over the raw trace.
 %
 %   plot_eog(csvPath, 'ShowStats', false)
 %       Omits the epoch-deviation panel.
@@ -34,27 +44,38 @@ function T = plot_eog(source, varargin)
 %       plot_eog('data/S1_filtered.csv')
 %       plot_eog('data/S1_filtered.csv', 'TimeRange', [100 108])
 %       plot_eog('data/S1_filtered.csv', 'TimeRange', [0 12], 'Channel', 'h')
+%       plot_eog('data/S1_filtered.csv', 'Style', 'stacked')
 %
-%   Panels, per channel:
-%       1. Raw signal, with the epoch mean drawn over it. The gap between the
-%          two is the baseline drift that standardization removes.
-%       2. Filtered output: standardized, then Savitzky-Golay smoothed.
-%       3. Epoch standard deviation. This is the scale the z-score divides out,
-%          and is where saccades and blinks separate: saccades are mostly
-%          horizontal in this protocol, blinks mostly vertical.
+%   Background shading marks the ground-truth label of each sample. The epoch
+%   deviation panel shows the scale the z-score divides out, which is where
+%   saccades and blinks separate: saccades are mostly horizontal in this
+%   protocol, blinks mostly vertical.
 %
-%   Background shading marks the ground-truth label of each sample.
+%   Requires R2016a or later for yyaxis in the overlay style.
+
+%% ------------------------------------------------------------------ colours
+C.raw   = [0.15 0.15 0.15];
+C.mean  = [0.85 0.20 0.20];
+C.filt  = [0.10 0.35 0.75];
+C.sd    = [0.10 0.55 0.25];
+C.zero  = [0.60 0.60 0.60];
+C.label = [0.80 0.88 0.98;    % 1 forward saccade: blue
+           0.82 0.94 0.82;    % 2 return saccade:  green
+           0.99 0.91 0.78];   % 3 blink:           amber
 
 %% ------------------------------------------------------------------ options
 p = inputParser;
 p.addRequired('source', @(x) ischar(x) || isstring(x) || istable(x));
 p.addParameter('TimeRange', [], @(x) isnumeric(x) && numel(x) == 2);
 p.addParameter('Channel', 'both', @(s) any(strcmpi(s, {'h', 'v', 'both'})));
+p.addParameter('Style', 'overlay', @(s) any(strcmpi(s, {'overlay', 'stacked'})));
 p.addParameter('ShowStats', true, @islogical);
+p.addParameter('ShowMean', true, @islogical);
 p.parse(source, varargin{:});
 opt = p.Results;
 
 channel = lower(opt.Channel);
+style   = lower(opt.Style);
 
 %% --------------------------------------------------------------- load data
 if istable(source)
@@ -101,7 +122,7 @@ if ~any(keep)
           t0, t1, T.time_s(1), T.time_s(end));
 end
 W = T(keep, :);
-fprintf('  plotting %d samples\n', height(W));
+fprintf('  plotting %d samples (%s)\n', height(W), style);
 
 %% ------------------------------------------------------------------- layout
 switch channel
@@ -109,11 +130,15 @@ switch channel
     otherwise,   channels = {channel};
 end
 
-nRows = 2 + double(opt.ShowStats);
+if strcmp(style, 'overlay')
+    nRows = 1 + double(opt.ShowStats);
+else
+    nRows = 2 + double(opt.ShowStats);
+end
 nCols = numel(channels);
 
 figure('Name', sprintf('EOG raw vs filtered  (%.1f-%.1f s)', t0, t1), ...
-       'Color', 'w', 'Position', [80 60 640 * nCols 820]);
+       'Color', 'w', 'Position', [80 60 660 * nCols, 300 * nRows + 120]);
 
 axesList = gobjects(nRows, nCols);
 
@@ -130,46 +155,27 @@ for c = 1:nCols
     mu   = W.(['mean_' ch]);
     sd   = W.(['sd_'   ch]);
 
-    % -- panel 1: raw signal with the epoch mean over it -------------------
-    ax = subplot(nRows, nCols, c);
-    axesList(1, c) = ax;
-    hold(ax, 'on');
-    shadeLabels(ax, W.time_s, W.label);
-    plot(ax, W.time_s, raw, 'Color', [0.15 0.15 0.15], 'LineWidth', 0.8);
-    plot(ax, W.time_s, mu,  'Color', [0.85 0.20 0.20], 'LineWidth', 1.4);
-    hold(ax, 'off');
-    ylabel(ax, 'amplitude');
-    title(ax, sprintf('%s - raw (black) and epoch mean (red)', chName));
-    grid(ax, 'on');
-    fitY(ax, [raw; mu]);
+    if strcmp(style, 'overlay')
+        ax = subplot(nRows, nCols, c);
+        axesList(1, c) = ax;
+        drawOverlay(ax, W.time_s, raw, mu, filt, W.label, C, ...
+                    opt.ShowMean, chName);
+        row = 1;
+    else
+        ax = subplot(nRows, nCols, c);
+        axesList(1, c) = ax;
+        drawRaw(ax, W.time_s, raw, mu, W.label, C, opt.ShowMean, chName);
 
-    % -- panel 2: filtered output ------------------------------------------
-    ax = subplot(nRows, nCols, nCols + c);
-    axesList(2, c) = ax;
-    hold(ax, 'on');
-    shadeLabels(ax, W.time_s, W.label);
-    % Zero line drawn with plot rather than yline, which needs R2018b
-    plot(ax, [W.time_s(1) W.time_s(end)], [0 0], ...
-         'Color', [0.6 0.6 0.6], 'HandleVisibility', 'off');
-    plot(ax, W.time_s, filt, 'Color', [0.10 0.35 0.75], 'LineWidth', 1.0);
-    hold(ax, 'off');
-    ylabel(ax, 'z-score');
-    title(ax, sprintf('%s - standardized + Savitzky-Golay', chName));
-    grid(ax, 'on');
-    fitY(ax, filt);
+        ax = subplot(nRows, nCols, nCols + c);
+        axesList(2, c) = ax;
+        drawFiltered(ax, W.time_s, filt, W.label, C, chName);
+        row = 2;
+    end
 
-    % -- panel 3: epoch deviation ------------------------------------------
     if opt.ShowStats
-        ax = subplot(nRows, nCols, 2 * nCols + c);
-        axesList(3, c) = ax;
-        hold(ax, 'on');
-        shadeLabels(ax, W.time_s, W.label);
-        plot(ax, W.time_s, sd, 'Color', [0.10 0.55 0.25], 'LineWidth', 1.2);
-        hold(ax, 'off');
-        ylabel(ax, 'epoch sd');
-        title(ax, sprintf('%s - epoch deviation (the scale divided out)', chName));
-        grid(ax, 'on');
-        fitY(ax, sd);
+        ax = subplot(nRows, nCols, row * nCols + c);
+        axesList(row + 1, c) = ax;
+        drawDeviation(ax, W.time_s, sd, W.label, C, chName);
     end
 
     xlabel(axesList(end, c), 'time (s)');
@@ -179,14 +185,113 @@ end
 linkaxes(axesList(:), 'x');
 xlim(axesList(1, 1), [t0 t1]);
 
-addLabelLegend(axesList(1, 1));
-
 end % plot_eog
 
 
 %% ======================================================================
+function drawOverlay(ax, t, raw, mu, filt, label, C, showMean, chName)
+%DRAWOVERLAY  Raw on the left scale, filtered output on the right.
+%
+%   Each side gets its own limits, set from its own data, so the two traces
+%   fill the panel rather than one collapsing against the other's range. The
+%   axis rulers are coloured to match their traces, since with two scales the
+%   numbers alone do not say which belongs to which.
+
+% ---- left: raw, in the recording's own units
+yyaxis(ax, 'left');
+hold(ax, 'on');
+shadeLabels(ax, t, label, C.label);
+h = gobjects(0);
+names = {};
+hRaw = plot(ax, t, raw, 'Color', C.raw, 'LineWidth', 0.8, 'LineStyle', '-');
+h(end+1) = hRaw;  names{end+1} = 'raw';
+if showMean
+    hMean = plot(ax, t, mu, 'Color', C.mean, 'LineWidth', 1.4, 'LineStyle', '-');
+    h(end+1) = hMean;  names{end+1} = 'epoch mean';
+    fitY(ax, [raw; mu]);
+else
+    fitY(ax, raw);
+end
+ylabel(ax, 'raw amplitude');
+ax.YAxis(1).Color = C.raw;
+
+% ---- right: standardized and smoothed output
+yyaxis(ax, 'right');
+hold(ax, 'on');
+plot(ax, [t(1) t(end)], [0 0], 'Color', C.zero, ...
+     'LineStyle', '-', 'HandleVisibility', 'off');
+hFilt = plot(ax, t, filt, 'Color', C.filt, 'LineWidth', 1.2, 'LineStyle', '-');
+h(end+1) = hFilt;  names{end+1} = 'filtered (z)';
+fitY(ax, filt);
+ylabel(ax, 'filtered (z-score)');
+ax.YAxis(2).Color = C.filt;
+
+hold(ax, 'off');
+title(ax, sprintf('%s - raw (left scale) over filtered (right scale)', chName));
+grid(ax, 'on');
+
+addLegend(ax, h, names, C.label);
+end
+
+
+%% ======================================================================
+function drawRaw(ax, t, raw, mu, label, C, showMean, chName)
+%DRAWRAW  Raw signal with the epoch mean over it, in its own panel.
+
+hold(ax, 'on');
+shadeLabels(ax, t, label, C.label);
+h = plot(ax, t, raw, 'Color', C.raw, 'LineWidth', 0.8);
+names = {'raw'};
+if showMean
+    h(end+1) = plot(ax, t, mu, 'Color', C.mean, 'LineWidth', 1.4);
+    names{end+1} = 'epoch mean';
+    fitY(ax, [raw; mu]);
+else
+    fitY(ax, raw);
+end
+hold(ax, 'off');
+ylabel(ax, 'raw amplitude');
+title(ax, sprintf('%s - raw and epoch mean', chName));
+grid(ax, 'on');
+addLegend(ax, h, names, C.label);
+end
+
+
+%% ======================================================================
+function drawFiltered(ax, t, filt, label, C, chName)
+%DRAWFILTERED  Standardized and smoothed output, in its own panel.
+
+hold(ax, 'on');
+shadeLabels(ax, t, label, C.label);
+% Zero line drawn with plot rather than yline, which needs R2018b
+plot(ax, [t(1) t(end)], [0 0], 'Color', C.zero, 'HandleVisibility', 'off');
+plot(ax, t, filt, 'Color', C.filt, 'LineWidth', 1.0);
+hold(ax, 'off');
+fitY(ax, filt);
+ylabel(ax, 'z-score');
+title(ax, sprintf('%s - standardized + Savitzky-Golay', chName));
+grid(ax, 'on');
+end
+
+
+%% ======================================================================
+function drawDeviation(ax, t, sd, label, C, chName)
+%DRAWDEVIATION  Epoch standard deviation, the scale the z-score divides out.
+
+hold(ax, 'on');
+shadeLabels(ax, t, label, C.label);
+plot(ax, t, sd, 'Color', C.sd, 'LineWidth', 1.2);
+hold(ax, 'off');
+fitY(ax, sd);
+ylabel(ax, 'epoch sd');
+title(ax, sprintf('%s - epoch deviation (the scale divided out)', chName));
+grid(ax, 'on');
+end
+
+
+%% ======================================================================
 function fitY(ax, data)
-%FITY  Set the y limits from the data, ignoring the shading patches.
+%FITY  Set the y limits of the active side from the data alone.
 %
 %   The background patches deliberately span a far larger y range than the
 %   data so they fill the panel whatever the limits turn out to be. Left on
@@ -211,32 +316,25 @@ end
 
 
 %% ======================================================================
-function shadeLabels(ax, t, label)
+function shadeLabels(ax, t, label, colours)
 %SHADELABELS  Shade the background by ground-truth label.
 %
 %   Draws one patch per contiguous run of the same label, so a 4 s trial
-%   becomes three bands rather than thousands of slivers. Patches are drawn
-%   before the data and pushed to the back, and are excluded from the legend.
+%   becomes three bands rather than thousands of slivers. Row k of `colours`
+%   is the colour for label k; label 0 (none) has no row and stays unshaded.
 
 if isempty(t)
     return
 end
 
-% Index by label value: row 1 is label 1, and so on. Label 0 (none) has no row
-% and is left unshaded.
-colours = [0.80 0.88 0.98;    % 1 forward saccade: blue
-           0.82 0.94 0.82;    % 2 return saccade:  green
-           0.99 0.91 0.78];   % 3 blink:           amber
-
 label = double(label(:));     % readtable may hand back an integer type
 t = double(t(:));
 
-% Boundaries of each run of identical labels, so a 4 s trial becomes three
-% bands rather than thousands of slivers
+% Boundaries of each run of identical labels
 edges = [1; find(diff(label) ~= 0) + 1; numel(label) + 1];
 
 yLo = -1e6;
-yHi =  1e6;   % patches span far beyond the data; the axis limits clip them
+yHi =  1e6;   % patches span far beyond the data; fitY clips them back
 
 for k = 1:numel(edges) - 1
     first = edges(k);
@@ -245,10 +343,9 @@ for k = 1:numel(edges) - 1
     if lab < 1 || lab > size(colours, 1)
         continue
     end
-    x0 = t(first);
-    x1 = t(last);
-    patch(ax, [x0 x1 x1 x0], [yLo yLo yHi yHi], colours(lab, :), ...
-          'EdgeColor', 'none', 'FaceAlpha', 0.55, 'HandleVisibility', 'off');
+    patch(ax, [t(first) t(last) t(last) t(first)], [yLo yLo yHi yHi], ...
+          colours(lab, :), 'EdgeColor', 'none', 'FaceAlpha', 0.55, ...
+          'HandleVisibility', 'off');
 end
 % Callers shade before plotting, so these patches are created first and render
 % behind the traces without any explicit restacking.
@@ -256,22 +353,25 @@ end
 
 
 %% ======================================================================
-function addLabelLegend(ax)
-%ADDLABELLEGEND  Legend naming the shading colours.
+function addLegend(ax, traceHandles, traceNames, colours)
+%ADDLEGEND  Name the traces and the label shading in one legend.
 %
-%   The shading patches are hidden from the legend, so draw three invisible
-%   dummy patches whose only job is to carry the names.
+%   The shading patches are hidden from the legend, so three invisible dummy
+%   patches carry the label names. Trace handles are passed in explicitly
+%   because with two y axes a bare legend call sees only the active side.
 
-colours = [0.80 0.88 0.98; 0.82 0.94 0.82; 0.99 0.91 0.78];
+labelNames = {'forward saccade', 'return saccade', 'blink'};
 
 hold(ax, 'on');
-h = gobjects(1, 3);
-for k = 1:3
-    h(k) = patch(ax, 'XData', NaN, 'YData', NaN, ...
-                 'FaceColor', colours(k, :), 'EdgeColor', 'none');
+dummies = gobjects(1, size(colours, 1));
+for k = 1:size(colours, 1)
+    dummies(k) = patch(ax, 'XData', NaN, 'YData', NaN, ...
+                       'FaceColor', colours(k, :), 'EdgeColor', 'none');
 end
 hold(ax, 'off');
-legend(ax, h, {'forward saccade', 'return saccade', 'blink'}, ...
-       'Location', 'northeast', 'Orientation', 'horizontal', ...
+
+legend(ax, [traceHandles(:); dummies(:)], ...
+       [traceNames(:); labelNames(:)], ...
+       'Location', 'northoutside', 'Orientation', 'horizontal', ...
        'FontSize', 8, 'Box', 'off');
 end

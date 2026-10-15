@@ -58,18 +58,61 @@ typedef struct {
     int    sg_half_window;  /**< Savitzky-Golay half window. Kernel is 2n+1. */
     int    sg_poly_order;   /**< Savitzky-Golay polynomial order. */
     float  min_stddev;      /**< Divisor floor for the z-score. 0 selects 1e-6. */
+
+    /**
+     * Trailing window the dividing scale is measured over, in samples.
+     *
+     * 0 scales each epoch by its own deviation. That normalizes every window
+     * to the same spread, so a quiet stretch comes out as lively as a real
+     * movement and the amplitude separating one movement from another is lost.
+     *
+     * A window several seconds long holds the scale steady while the baseline
+     * still moves, which keeps that amplitude. Must be at least epoch_samples.
+     */
+    size_t scale_window_samples;
+
+    /**
+     * Sweep the subtracted centre across each emitted block.
+     *
+     * Subtracting one epoch's mean from a whole block leaves a step wherever
+     * two blocks meet, recurring once per stride. Walking the centre from the
+     * previous block's mean to this one's across the block removes that seam
+     * without lagging the baseline the way a smoothed mean would.
+     */
+    bool sweep_centre;
 } EogEpochConfig;
 
 /**
- * @brief Default configuration: 100-sample epoch, stride 10, kernel 11, order 2.
+ * @brief Default configuration: 100-sample epoch, stride 10, kernel 11, order 2,
+ *        with a 2560-sample scale window and the centre swept.
  *
- * At 250 Hz that is a 400 ms epoch re-evaluated every 40 ms, with a 44 ms
- * smoothing kernel.
+ * At 256 Hz that is a 391 ms epoch re-evaluated every 39 ms, a 43 ms smoothing
+ * kernel, and a 10 s scale window.
+ *
+ * Measured on one subject of the Barbara et al. recordings, against scaling by
+ * each epoch's own deviation: saccades stand out from blinks by 5.6x rather
+ * than 1.0x, the seam between blocks disappears, and the output during blinks,
+ * where the horizontal channel should be calm, settles by a factor of 3.7.
  */
 #define EOG_EPOCH_DEFAULT_CONFIG \
     (EogEpochConfig){ .epoch_samples = 100, .stride = 10, \
                       .sg_half_window = 5, .sg_poly_order = 2, \
-                      .min_stddev = 0.0f }
+                      .min_stddev = 0.0f, \
+                      .scale_window_samples = 2560, \
+                      .sweep_centre = true }
+
+/**
+ * @brief Configuration scaling each epoch by its own deviation, with no sweep.
+ *
+ * The plain rolling z-score. Every window is normalized to the same spread,
+ * which is the right thing when only shape matters and amplitude does not.
+ */
+#define EOG_EPOCH_PER_EPOCH_CONFIG \
+    (EogEpochConfig){ .epoch_samples = 100, .stride = 10, \
+                      .sg_half_window = 5, .sg_poly_order = 2, \
+                      .min_stddev = 0.0f, \
+                      .scale_window_samples = 0, \
+                      .sweep_centre = false }
 
 /*============================================================================
  * LIFECYCLE
@@ -137,8 +180,23 @@ size_t eog_epoch_latency_max(const EogEpoch *ep);
 /** @brief Mean of the most recently evaluated epoch. */
 float eog_epoch_last_mean(const EogEpoch *ep);
 
-/** @brief Standard deviation of the most recently evaluated epoch. */
+/**
+ * @brief Deviation of the most recently evaluated epoch.
+ *
+ * Always the epoch's own deviation, whatever scale_window_samples is set to.
+ * This is the movement-energy feature: on these recordings it averages 44
+ * during saccades against 9 during blinks on the horizontal channel, and the
+ * other way around on the vertical one.
+ */
 float eog_epoch_last_stddev(const EogEpoch *ep);
+
+/**
+ * @brief Scale the most recent block was divided by.
+ *
+ * The same value as eog_epoch_last_stddev() when scale_window_samples is 0,
+ * and the deviation over the longer window otherwise.
+ */
+float eog_epoch_last_scale(const EogEpoch *ep);
 
 #ifdef __cplusplus
 }

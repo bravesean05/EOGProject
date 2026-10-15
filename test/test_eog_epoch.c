@@ -155,11 +155,15 @@ static void reference_epoch(const float *src, size_t n, float *dst,
 static void test_block_alignment(void)
 {
     /* Each emitted block must be the slice [EPOCH-STRIDE-HALF, EPOCH-HALF) of
-     * its own epoch, and successive epochs must advance by exactly STRIDE. This
-     * is checked against a direct per-epoch recomputation rather than by looking
-     * for continuity across block boundaries: blocks are standardized against
-     * their own epoch statistics, so they deliberately do not join smoothly. */
-    EogEpoch *ep = eog_epoch_create(NULL);
+     * its own epoch, and successive epochs must advance by exactly STRIDE.
+     *
+     * Run against the per-epoch configuration, whose reference is a plain
+     * standardize-then-filter over one epoch. The default configuration scales
+     * from a longer window and re-centres each block, both of which depend on
+     * history beyond the epoch and so have no single-epoch reference to check
+     * against; its own behaviour is pinned by the tests below. */
+    EogEpochConfig epcfg = EOG_EPOCH_PER_EPOCH_CONFIG;
+    EogEpoch *ep = eog_epoch_create(&epcfg);
     SavgolConfig cfg = SAVGOL_SMOOTH(HALF, ORDER);
     SavgolFilter *f = savgol_create(&cfg);
 
@@ -206,16 +210,16 @@ static void test_block_alignment(void)
     eog_epoch_destroy(ep);
 }
 
-static void test_boundary_discontinuity(void)
+/**
+ * @brief Largest boundary jump as a multiple of the ordinary sample spacing.
+ *
+ * 1.0 means blocks join as smoothly as samples within a block do, so the seam
+ * is invisible. Anything well above 1 is a step recurring once per stride,
+ * which in the output waveform is a periodic artifact.
+ */
+static double seam_ratio(const EogEpochConfig *cfg)
 {
-    /* Documents a consequence of standardizing per epoch: consecutive blocks are
-     * scaled by different statistics, so the output steps at every block
-     * boundary. The step is several times the within-block sample spacing and
-     * recurs once per stride, which is a periodic artifact in the output
-     * waveform. It is harmless if downstream code consumes blocks as
-     * independent feature windows, and is not if it treats the output as one
-     * continuous signal. */
-    EogEpoch *ep = eog_epoch_create(NULL);
+    EogEpoch *ep = eog_epoch_create(cfg);
     float out[STRIDE];
 
     double max_step = 0.0;
@@ -243,13 +247,109 @@ static void test_boundary_discontinuity(void)
         have_prev = true;
     }
 
-    TEST("Block boundaries step, as per-epoch scaling implies");
-    if (max_jump > max_step) PASS();
-    else FAIL("expected a visible step at block boundaries");
+    eog_epoch_destroy(ep);
+    return (max_step > 0.0) ? (max_jump / max_step) : 0.0;
+}
 
-    printf("      (within-block step %.4f, boundary jump %.4f, ratio %.1fx)\n",
-           max_step, max_jump, max_jump / max_step);
+static void test_boundary_continuity(void)
+{
+    EogEpochConfig plain = EOG_EPOCH_PER_EPOCH_CONFIG;
+    EogEpochConfig swept = EOG_EPOCH_DEFAULT_CONFIG;
 
+    double r_plain = seam_ratio(&plain);
+    double r_swept = seam_ratio(&swept);
+
+    TEST("Per-epoch scaling leaves a seam between blocks");
+    if (r_plain > 1.2) PASS();
+    else FAIL("expected a visible step without the sweep");
+
+    TEST("Sweeping the centre removes the seam");
+    if (r_swept < 1.2) PASS();
+    else FAIL("blocks still step at the boundary");
+
+    printf("      (seam: per-epoch %.1fx, default %.1fx)\n", r_plain, r_swept);
+}
+
+static void test_amplitude_preserved(void)
+{
+    /* The point of scaling from a longer window: a loud stretch should come out
+     * louder than a quiet one. Scaling each epoch by its own deviation puts
+     * both on the same spread, which is what loses the distinction.
+     *
+     * Feed alternating quiet and loud stretches, each several epochs long, and
+     * compare the output magnitude between them. */
+    const int RUN = 600;        /* samples per stretch */
+    const int RUNS = 10;
+
+    double ratio[2];
+    EogEpochConfig cfgs[2];
+    cfgs[0] = EOG_EPOCH_PER_EPOCH_CONFIG;
+    cfgs[1] = EOG_EPOCH_DEFAULT_CONFIG;
+
+    for (int which = 0; which < 2; which++) {
+        EogEpoch *ep = eog_epoch_create(&cfgs[which]);
+        float out[STRIDE];
+        double quiet = 0.0, loud = 0.0;
+        size_t nq = 0, nl = 0;
+
+        for (int i = 0; i < RUN * RUNS; i++) {
+            bool isLoud = ((i / RUN) % 2) == 1;
+            double amp = isLoud ? 40.0 : 2.0;
+            double v = 2000.0 + amp * sin(i * 0.25);
+            int n = eog_epoch_push(ep, (float)v, out, STRIDE);
+            if (n != STRIDE) {
+                continue;
+            }
+            /* Attribute the block to the stretch its samples came from */
+            for (int k = 0; k < n; k++) {
+                if (isLoud) { loud += fabs((double)out[k]); nl++; }
+                else        { quiet += fabs((double)out[k]); nq++; }
+            }
+        }
+        eog_epoch_destroy(ep);
+        ratio[which] = (nq && nl) ? ((loud / (double)nl) / (quiet / (double)nq))
+                                  : 0.0;
+    }
+
+    TEST("Per-epoch scaling flattens loud against quiet");
+    if (ratio[0] < 3.0) PASS();
+    else FAIL("expected per-epoch scaling to normalize the difference away");
+
+    TEST("A longer scale window keeps loud louder than quiet");
+    if (ratio[1] > ratio[0] * 2.0) PASS();
+    else FAIL("longer scale window did not preserve the amplitude difference");
+
+    printf("      (loud/quiet: per-epoch %.2fx, default %.2fx)\n",
+           ratio[0], ratio[1]);
+}
+
+static void test_scale_window_validation(void)
+{
+    TEST("Reject a scale window shorter than the epoch");
+    EogEpochConfig cfg = EOG_EPOCH_DEFAULT_CONFIG;
+    cfg.scale_window_samples = EPOCH - 1;
+    if (eog_epoch_create(&cfg) == NULL) PASS();
+    else FAIL("accepted a scale window smaller than the block it scales");
+
+    TEST("Accept a scale window equal to the epoch");
+    cfg.scale_window_samples = EPOCH;
+    EogEpoch *ep = eog_epoch_create(&cfg);
+    if (ep != NULL) PASS();
+    else FAIL("rejected the boundary case");
+    eog_epoch_destroy(ep);
+
+    TEST("Scale reported separately from the epoch deviation");
+    cfg = EOG_EPOCH_DEFAULT_CONFIG;
+    ep = eog_epoch_create(&cfg);
+    float out[STRIDE];
+    for (int i = 0; i < 1200; i++) {
+        double amp = (i > 600) ? 2.0 : 40.0;    /* loud, then quiet */
+        eog_epoch_push(ep, (float)(2000.0 + amp * sin(i * 0.25)), out, STRIDE);
+    }
+    /* The epoch is quiet by now, but the longer window still remembers the
+     * loud stretch, so the two must differ */
+    if (eog_epoch_last_scale(ep) > eog_epoch_last_stddev(ep) * 1.5) PASS();
+    else FAIL("scale tracked the epoch instead of the longer window");
     eog_epoch_destroy(ep);
 }
 
@@ -456,7 +556,9 @@ int main(void)
     printf("Configuration:\n");        test_config_validation();
     printf("\nEmission schedule:\n");   test_emission_schedule();
     printf("\nBlock alignment:\n");     test_block_alignment();
-    printf("\nBoundary behaviour:\n");  test_boundary_discontinuity();
+    printf("\nBoundary behaviour:\n");  test_boundary_continuity();
+    printf("\nAmplitude:\n");           test_amplitude_preserved();
+    printf("\nScale window:\n");        test_scale_window_validation();
     printf("\nLatency:\n");             test_latency_offset();
     printf("\nCentral region:\n");      test_central_region_only();
     printf("\nStandardization:\n");     test_standardization_stats();

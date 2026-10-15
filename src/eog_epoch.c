@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "eog_normalize.h"
 #include "savgolFilter.h"
 
 #define EOG_EPOCH_DEFAULT_MIN_STDDEV 1e-6f
@@ -29,6 +30,7 @@ struct EogEpoch {
     size_t stride;
     int    sg_half_window;
     float  min_stddev;
+    bool   sweep_centre;
 
     /* Trailing sample buffer, circular */
     float *buffer;
@@ -43,9 +45,19 @@ struct EogEpoch {
     /* Savitzky-Golay stage */
     SavgolFilter *filter;
 
+    /* Longer-window deviation supplying the dividing scale. NULL when each
+     * epoch is scaled by its own deviation. eog_normalize keeps this in O(1)
+     * per sample, so the longer window costs no more than the short one. */
+    EogNorm *scale;
+
+    /* Centre subtracted at the end of the previous block, for the sweep */
+    float  prev_centre;
+    bool   have_prev_centre;
+
     /* Statistics from the most recent evaluation */
     float last_mean;
     float last_stddev;
+    float last_scale;
 };
 
 /*============================================================================
@@ -67,12 +79,17 @@ static void eog_epoch_linearize(EogEpoch *ep)
 }
 
 /**
- * @brief Standardize `epoch` in place against its own mean and stddev.
+ * @brief Standardize `epoch` in place, returning the divisor that was used.
+ *
+ * The centre is the epoch's own mean. The scale is either that epoch's
+ * deviation or, when a longer scale window is configured, the deviation over
+ * that window: holding the scale steady is what keeps a large movement looking
+ * larger than a quiet stretch instead of normalizing both to the same spread.
  *
  * Two passes rather than running sums: the mean is subtracted before squaring,
  * so no large cancellation occurs even when the baseline dwarfs the signal.
  */
-static void eog_epoch_standardize(EogEpoch *ep)
+static double eog_epoch_standardize(EogEpoch *ep)
 {
     size_t n = ep->epoch_samples;
 
@@ -92,12 +109,20 @@ static void eog_epoch_standardize(EogEpoch *ep)
     ep->last_mean   = (float)mean;
     ep->last_stddev = (float)sd;
 
-    /* Guard a flat epoch, where every sample equals the mean */
-    double divisor = (sd < (double)ep->min_stddev) ? (double)ep->min_stddev : sd;
+    double scale = (ep->scale != NULL)
+                   ? (double)eog_norm_stddev(ep->scale)
+                   : sd;
+
+    /* Guard a flat window, where every sample equals the mean */
+    if (scale < (double)ep->min_stddev) {
+        scale = (double)ep->min_stddev;
+    }
+    ep->last_scale = (float)scale;
 
     for (size_t i = 0; i < n; i++) {
-        ep->epoch[i] = (float)(((double)ep->epoch[i] - mean) / divisor);
+        ep->epoch[i] = (float)(((double)ep->epoch[i] - mean) / scale);
     }
+    return scale;
 }
 
 /*============================================================================
@@ -126,6 +151,13 @@ EogEpoch *eog_epoch_create(const EogEpochConfig *config)
         return NULL;
     }
 
+    /* A scale window shorter than the epoch would be measuring less than the
+     * block it scales, which defeats the point of holding the scale steady */
+    if (cfg.scale_window_samples != 0 &&
+        cfg.scale_window_samples < cfg.epoch_samples) {
+        return NULL;
+    }
+
     EogEpoch *ep = (EogEpoch *)calloc(1, sizeof(EogEpoch));
     if (ep == NULL) {
         return NULL;
@@ -134,6 +166,7 @@ EogEpoch *eog_epoch_create(const EogEpochConfig *config)
     ep->epoch_samples  = cfg.epoch_samples;
     ep->stride         = cfg.stride;
     ep->sg_half_window = cfg.sg_half_window;
+    ep->sweep_centre   = cfg.sweep_centre;
     ep->min_stddev     = (cfg.min_stddev > 0.0f)
                          ? cfg.min_stddev : EOG_EPOCH_DEFAULT_MIN_STDDEV;
 
@@ -152,6 +185,14 @@ EogEpoch *eog_epoch_create(const EogEpochConfig *config)
         return NULL;
     }
 
+    if (cfg.scale_window_samples != 0) {
+        ep->scale = eog_norm_create_samples(cfg.scale_window_samples);
+        if (ep->scale == NULL) {
+            eog_epoch_destroy(ep);
+            return NULL;
+        }
+    }
+
     return ep;
 }
 
@@ -160,6 +201,7 @@ void eog_epoch_destroy(EogEpoch *ep)
     if (ep == NULL) {
         return;
     }
+    eog_norm_destroy(ep->scale);
     savgol_destroy(ep->filter);
     free(ep->filtered);
     free(ep->epoch);
@@ -172,11 +214,15 @@ void eog_epoch_reset(EogEpoch *ep)
     if (ep == NULL) {
         return;
     }
-    ep->write_pos   = 0;
-    ep->received    = 0;
-    ep->since_eval  = 0;
-    ep->last_mean   = 0.0f;
-    ep->last_stddev = 0.0f;
+    ep->write_pos        = 0;
+    ep->received         = 0;
+    ep->since_eval       = 0;
+    ep->last_mean        = 0.0f;
+    ep->last_stddev      = 0.0f;
+    ep->last_scale       = 0.0f;
+    ep->prev_centre      = 0.0f;
+    ep->have_prev_centre = false;
+    eog_norm_reset(ep->scale);
     memset(ep->buffer, 0, ep->epoch_samples * sizeof(float));
 }
 
@@ -195,6 +241,11 @@ int eog_epoch_push(EogEpoch *ep, float sample, float *out, int max_out)
     ep->received++;
     ep->since_eval++;
 
+    /* The longer scale window tracks every sample, not just block boundaries */
+    if (ep->scale != NULL) {
+        eog_norm_push(ep->scale, sample, NULL);
+    }
+
     /* Wait for a full epoch, then evaluate once per stride */
     if (ep->received < ep->epoch_samples || ep->since_eval < ep->stride) {
         return 0;
@@ -206,7 +257,7 @@ int eog_epoch_push(EogEpoch *ep, float sample, float *out, int max_out)
     }
 
     eog_epoch_linearize(ep);
-    eog_epoch_standardize(ep);
+    double scale = eog_epoch_standardize(ep);
 
     if (savgol_apply(ep->filter, ep->epoch, ep->filtered,
                      ep->epoch_samples) != 0) {
@@ -218,7 +269,31 @@ int eog_epoch_push(EogEpoch *ep, float sample, float *out, int max_out)
     size_t half  = (size_t)ep->sg_half_window;
     size_t begin = ep->epoch_samples - ep->stride - half;
 
-    memcpy(out, ep->filtered + begin, ep->stride * sizeof(float));
+    double mean = (double)ep->last_mean;
+
+    if (!ep->sweep_centre || !ep->have_prev_centre) {
+        memcpy(out, ep->filtered + begin, ep->stride * sizeof(float));
+    } else {
+        /* Re-centre the block onto a line running from the previous block's
+         * centre to this one's.
+         *
+         * Subtracting a centre and the filter are both linear, and a smoothing
+         * filter reproduces a constant exactly inside its central region,
+         * where this block lies. So shifting the centre after filtering gives
+         * the same result as having filtered against the shifted centre, and
+         * costs one add per sample instead of a second pass.
+         */
+        double prev = (double)ep->prev_centre;
+        for (size_t k = 0; k < ep->stride; k++) {
+            double frac = (double)(k + 1) / (double)ep->stride;
+            double centre = prev + (mean - prev) * frac;
+            out[k] = (float)((double)ep->filtered[begin + k]
+                             + (mean - centre) / scale);
+        }
+    }
+
+    ep->prev_centre = (float)mean;
+    ep->have_prev_centre = true;
     return (int)ep->stride;
 }
 
@@ -257,4 +332,9 @@ float eog_epoch_last_mean(const EogEpoch *ep)
 float eog_epoch_last_stddev(const EogEpoch *ep)
 {
     return (ep != NULL) ? ep->last_stddev : 0.0f;
+}
+
+float eog_epoch_last_scale(const EogEpoch *ep)
+{
+    return (ep != NULL) ? ep->last_scale : 0.0f;
 }

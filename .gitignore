@@ -8,3 +8,8 @@
 
 # Editor / tooling caches
 /.cache
+
+# Converted recordings and filter output: regenerate with
+#   python tools/convert_dataset.py <dataset_dir> data/converted
+#   build/filter_dataset data/converted/S1.eog -o data/S1_filtered.csv
+/data/

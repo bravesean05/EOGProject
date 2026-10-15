@@ -30,6 +30,7 @@ add_subdirectory(Savitzky-Golay-Filter)
 add_library(eog_preprocess STATIC
     src/eog_normalize.c
     src/eog_epoch.c
+    src/eog_dataset.c
 )
 
 target_include_directories(eog_preprocess PUBLIC
@@ -59,3 +60,9 @@ add_test(NAME EogEpochTests COMMAND test_eog_epoch)
 # -----------------------------------------------------------------------------
 add_executable(eog_pipeline_demo examples/pipeline_demo.c)
 target_link_libraries(eog_pipeline_demo PRIVATE eog_preprocess)
+
+# -----------------------------------------------------------------------------
+# Dataset tool: filters a recording converted by tools/convert_dataset.py
+# -----------------------------------------------------------------------------
+add_executable(filter_dataset tools/filter_dataset.c)
+target_link_libraries(filter_dataset PRIVATE eog_preprocess)

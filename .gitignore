@@ -1,0 +1,10 @@
+# Build output
+/build/
+
+# Build artifacts
+*.exe
+*.o
+*.a
+
+# Editor / tooling caches
+/.cache

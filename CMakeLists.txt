@@ -1,0 +1,61 @@
+# =============================================================================
+# EOGProject — real-time EOG signal processing
+# =============================================================================
+# Preprocessing stages that feed the Savitzky-Golay filter, which lives in the
+# Savitzky-Golay-Filter submodule and is built from there.
+
+cmake_minimum_required(VERSION 3.10)
+
+project(EOGProject LANGUAGES C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+enable_testing()
+
+# -----------------------------------------------------------------------------
+# Savitzky-Golay filter (submodule)
+# -----------------------------------------------------------------------------
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Savitzky-Golay-Filter/CMakeLists.txt")
+    message(FATAL_ERROR
+        "The Savitzky-Golay-Filter submodule is empty. Fetch it with:\n"
+        "  git submodule update --init --recursive")
+endif()
+
+add_subdirectory(Savitzky-Golay-Filter)
+
+# -----------------------------------------------------------------------------
+# Preprocessing library
+# -----------------------------------------------------------------------------
+add_library(eog_preprocess STATIC
+    src/eog_normalize.c
+    src/eog_epoch.c
+)
+
+target_include_directories(eog_preprocess PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+# eog_epoch drives the Savitzky-Golay batch filter directly
+target_link_libraries(eog_preprocess PUBLIC savgolFilter)
+
+if(UNIX)
+    target_link_libraries(eog_preprocess PUBLIC m)
+endif()
+
+# -----------------------------------------------------------------------------
+# Tests
+# -----------------------------------------------------------------------------
+add_executable(test_eog_normalize test/test_eog_normalize.c)
+target_link_libraries(test_eog_normalize PRIVATE eog_preprocess)
+add_test(NAME EogNormalizeTests COMMAND test_eog_normalize)
+
+add_executable(test_eog_epoch test/test_eog_epoch.c)
+target_link_libraries(test_eog_epoch PRIVATE eog_preprocess)
+add_test(NAME EogEpochTests COMMAND test_eog_epoch)
+
+# -----------------------------------------------------------------------------
+# Pipeline demo: raw -> rolling z-score -> Savitzky-Golay smoothing
+# -----------------------------------------------------------------------------
+add_executable(eog_pipeline_demo examples/pipeline_demo.c)
+target_link_libraries(eog_pipeline_demo PRIVATE eog_preprocess)

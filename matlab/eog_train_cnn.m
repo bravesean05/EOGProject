@@ -11,7 +11,15 @@ function R = eog_train_cnn(DS, varargin)
 %
 %   Name-value options:
 %     'TestSubject'   subject held out for the final score   (default last)
+%                     '' trains on it instead, with no test score
 %     'ValSubject'    subject held out for early stopping    (default second last)
+%                     '' trains on it instead, running MaxEpochs in full
+%
+%   Passing '' for both trains the deployment model on every subject. Cross-
+%   validation is what establishes how well the method generalizes; once it
+%   has, the model to ship is one trained on all the data, with the epoch
+%   count fixed from what the folds needed, since there is nothing left to
+%   stop early against.
 %     'MaxEpochs'     (default 60)
 %     'MiniBatchSize' (default 64)
 %     'LearnRate'     (default 1e-3)
@@ -39,14 +47,16 @@ rng(opt.Seed);
 
 testSub = char(opt.TestSubject);
 valSub  = char(opt.ValSubject);
-if strcmp(testSub, valSub)
+if ~isempty(testSub) && strcmp(testSub, valSub)
     error('eog_train_cnn:sameSubject', ...
           'TestSubject and ValSubject must differ; both are %s', testSub);
 end
 
 %% ------------------------------------------------------------------- split
-isTest = DS.subject == testSub;
-isVal  = DS.subject == valSub;
+isTest = false(size(DS.subject));
+isVal  = false(size(DS.subject));
+if ~isempty(testSub), isTest = DS.subject == testSub; end
+if ~isempty(valSub),  isVal  = DS.subject == valSub;  end
 isTrain = ~isTest & ~isVal;
 
 XTrain = DS.X(isTrain); YTrain = DS.Y(isTrain);
@@ -56,8 +66,8 @@ XTest  = DS.X(isTest);  YTest  = DS.Y(isTest);
 fprintf('Split by subject\n');
 fprintf('  train : %-28s %5d windows\n', ...
         strjoin(setdiff(subs, {testSub, valSub})', ' '), numel(XTrain));
-fprintf('  val   : %-28s %5d windows\n', valSub, numel(XVal));
-fprintf('  test  : %-28s %5d windows\n\n', testSub, numel(XTest));
+fprintf('  val   : %-28s %5d windows\n', orNone(valSub), numel(XVal));
+fprintf('  test  : %-28s %5d windows\n\n', orNone(testSub), numel(XTest));
 
 %% --------------------------------------------------- balance the training set
 if opt.Balance
@@ -91,22 +101,30 @@ layers = [
     fullyConnectedLayer(numClasses)
     softmaxLayer];
 
-options = trainingOptions("adam", ...
-    MaxEpochs=opt.MaxEpochs, ...
-    MiniBatchSize=opt.MiniBatchSize, ...
-    InitialLearnRate=opt.LearnRate, ...
-    LearnRateSchedule="piecewise", ...
-    LearnRateDropPeriod=25, ...
-    LearnRateDropFactor=0.2, ...
-    Shuffle="every-epoch", ...
-    ValidationData={XVal, YVal}, ...
-    ValidationFrequency=max(1, floor(numel(XTrain) / opt.MiniBatchSize)), ...
-    ValidationPatience=12, ...
-    OutputNetwork="best-validation", ...
-    Verbose=true, ...
-    VerboseFrequency=50, ...
-    Plots="none", ...
-    ExecutionEnvironment="auto");
+common = {"MaxEpochs", opt.MaxEpochs, ...
+          "MiniBatchSize", opt.MiniBatchSize, ...
+          "InitialLearnRate", opt.LearnRate, ...
+          "LearnRateSchedule", "piecewise", ...
+          "LearnRateDropPeriod", 25, ...
+          "LearnRateDropFactor", 0.2, ...
+          "Shuffle", "every-epoch", ...
+          "Verbose", true, ...
+          "VerboseFrequency", 50, ...
+          "Plots", "none", ...
+          "ExecutionEnvironment", "auto"};
+
+if isempty(XVal)
+    % Nothing to stop against, so the run goes to MaxEpochs and keeps the
+    % network it ends with
+    options = trainingOptions("adam", common{:}, ...
+        "OutputNetwork", "last-iteration");
+else
+    options = trainingOptions("adam", common{:}, ...
+        "ValidationData", {XVal, YVal}, ...
+        "ValidationFrequency", max(1, floor(numel(XTrain) / opt.MiniBatchSize)), ...
+        "ValidationPatience", 12, ...
+        "OutputNetwork", "best-validation");
+end
 
 fprintf('Training...\n');
 net = trainnet(XTrain, YTrain, layers, "crossentropy", options);
@@ -116,19 +134,32 @@ R.net = net;
 R.classes = DS.classes;
 R.testSubject = testSub;
 R.valSubject = valSub;
+R.trainSubjects = setdiff(subs, {testSub, valSub})';
 
 [R.valAccuracy,  R.valConfusion]  = scoreSet(net, XVal,  YVal,  DS.classes);
 [R.testAccuracy, R.testConfusion] = scoreSet(net, XTest, YTest, DS.classes);
 
-fprintf('\nValidation (%s): %.1f%%\n', valSub, 100 * R.valAccuracy);
-fprintf('Test       (%s): %.1f%%\n\n', testSub, 100 * R.testAccuracy);
-
-printConfusion(R.testConfusion, DS.classes, testSub);
+if ~isempty(XVal)
+    fprintf('\nValidation (%s): %.1f%%\n', valSub, 100 * R.valAccuracy);
+end
+if ~isempty(XTest)
+    fprintf('Test       (%s): %.1f%%\n\n', testSub, 100 * R.testAccuracy);
+    printConfusion(R.testConfusion, DS.classes, testSub);
+else
+    fprintf('\nNo held-out subject: trained on all of %s\n', ...
+            strjoin(R.trainSubjects, ' '));
+end
 
 if ~isempty(char(opt.Save))
     save(char(opt.Save), 'R', '-v7.3');
     fprintf('\n  saved %s\n', char(opt.Save));
 end
+end
+
+
+%% ======================================================================
+function s = orNone(s)
+if isempty(s), s = '(none)'; end
 end
 
 
